@@ -1,0 +1,590 @@
+# One instance's trip to Test and then Prod — the pipeline
+# docs/operations.md#the-deployment-pipeline describes. `deploy.yml` calls this
+# once per instance, in parallel.
+#
+# Two categories decided by git (code-only vs schema), one human gate (the
+# schema-change-approval environment) whose evidence lives in the "Deploy to Test and
+# verify" job summary, force inherited from Test's refusal, Prod deployed only by the
+# production-environment federated identity.
+#
+# A REUSABLE workflow rather than `strategy: matrix` on each job, and that is
+# load-bearing: `needs` between matrix jobs waits for every leg, so one
+# instance's failed Test deploy would block a different instance's Prod deploy.
+# Instances share a codebase, not a fate — the whole point is that a bad
+# migration in one domain does not stop a UI fix reaching the others.
+name: deploy instance
+on:
+  workflow_call:
+    inputs:
+      instance:
+        description: Directory name under instances/ — selects tables, item id and workspaces.
+        required: true
+        type: string
+      key:
+        description: The instance name upper-cased, for looking up its FABRIC_*_<KEY> variables.
+        required: true
+        type: string
+
+# Nothing by default — every job below declares the scopes it needs and gets
+# only those. A job-level block REPLACES this one rather than adding to it, so
+# each list has to be complete. The scope that motivates the split is
+# `id-token: write`: it mints the OIDC token the federated identities trade for
+# access to the Fabric workspaces, and only the four jobs that actually deploy
+# should be able to ask for one. Held workflow-wide, a compromised step in any
+# job — including the one that only runs `git diff` — could reach both
+# workspaces.
+permissions: {}
+
+# Per instance, not global: two instances deploying at once is normal and safe
+# (separate items, separate databases). Two runs of the SAME instance are not.
+concurrency:
+  group: deploy-${{ inputs.instance }}
+  cancel-in-progress: false
+
+env:
+  FABRIC_RESOURCE: https://api.fabric.microsoft.com
+  # Selects the instance everywhere: rayfin.yml reads it for `id` and
+  # `services.data.path`, and the CLI reads rayfin.yml through the SHELL
+  # environment. Passing it via `--env-file` would NOT work — `rayfin up db
+  # apply` never threads that flag into config interpolation, so the wrong
+  # instance's schema would be generated for the right item (measured).
+  RAYFIN_INSTANCE: ${{ inputs.instance }}
+  # Workspaces: one per environment by default, shared by every instance, with
+  # a per-instance override for an app that genuinely needs its own. Instances
+  # sharing a workspace is safe — each is a separate item, keyed by `id`, and
+  # each CI job is a fresh checkout with no deployments registry to retarget
+  # from. Hosting URLs are NOT shared: every item gets its own, whatever
+  # workspace it lives in.
+  #
+  # What sharing costs is a rule the platform will not enforce: workspace roles
+  # grant implied permissions on EVERY item, and a workspace Viewer can read
+  # every table over SQL. Domain users therefore get the app item shared with
+  # them; they must not be given a workspace role.
+  #
+  # The deployments API record this instance's baseline is read from and
+  # written to. Per instance: one shared "production" environment would make
+  # every instance's diff compare against whichever deployed last.
+  DEPLOY_ENVIRONMENT: production-${{ inputs.instance }}
+
+jobs:
+  categorize:
+    name: Did the schema change?
+    # main only, whatever the trigger. workflow_dispatch runs the workflow file
+    # of the ref it is dispatched from, so without this a branch could deploy —
+    # and the Prod credential is pinned to the `production` ENVIRONMENT, which
+    # is branch-independent unless the environment also restricts branches.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout, and the diff against the last deployed sha
+      deployments: read # find that sha
+      issues: read # the deploy-freeze check
+    outputs:
+      category: ${{ steps.decide.outputs.category }}
+      base_sha: ${{ steps.decide.outputs.base_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Refuse to deploy while frozen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          open=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=deploy-freeze:${{ inputs.instance }}&state=open" --jq 'length')
+          if [ "$open" != "0" ]; then
+            echo "### ${{ inputs.instance }} — frozen, nothing deployed" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "An earlier schema deploy left this instance's Prod database needing a person. Close \`deploy-freeze:${{ inputs.instance }}\` to release it. Every other instance still deploys." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A run's summary is often the first thing a stranger sees of this
+          # project. Say what the pipeline is before saying what it decided.
+          # Last successfully deployed sha = newest production deployment with a success status.
+          base=""
+          # Capture first: `for x in $(cmd)` discards the command's exit status
+          # even under `set -e` — the loop just iterates zero times. That turned
+          # an API blip into "no prior deployment", which defaults to the schema
+          # category, prints "(first deployment — everything is new)" as the
+          # approval evidence, and disables both rollback jobs (they require a
+          # non-empty base_sha). Fail closed instead.
+          deployments=$(gh api "repos/$GITHUB_REPOSITORY/deployments?environment=$DEPLOY_ENVIRONMENT&per_page=10" --jq '.[] | "\(.id):\(.sha)"') || {
+            echo "::error::Deployments API unreachable — refusing to deploy without a known baseline."
+            exit 1
+          }
+          for sha_env in $deployments; do
+            id="${sha_env%%:*}"; sha="${sha_env#*:}"
+            state=$(gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" --jq '.[0].state' 2>/dev/null || echo "")
+            if [ "$state" = "success" ]; then base="$sha"; break; fi
+          done
+          if [ -z "$base" ]; then
+            {
+              echo "### ${{ inputs.instance }} — first deploy to Prod"
+              echo "Nothing to compare against, so this counts as a schema change and needs approval."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "category=schema" >> "$GITHUB_OUTPUT"
+            echo "base_sha=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "base_sha=$base" >> "$GITHUB_OUTPUT"
+          if git diff --quiet "$base" HEAD -- rayfin/rayfin.yml packages/shared "instances/${{ inputs.instance }}"; then
+            category=code-only
+          else
+            category=schema
+          fi
+          {
+            if [ "$category" = "schema" ]; then
+              echo "### ${{ inputs.instance }} — schema change, approval required"
+              echo "\`instances/${{ inputs.instance }}/\`, \`packages/shared\` or \`rayfin.yml\` changed since the version now in Prod (\`${base:0:7}\`). This deploy can alter the database."
+              echo ""
+              echo "Test → checked → **a human approves** → Prod. The diff to approve is in *Deploy to Test and verify*."
+            else
+              echo "### ${{ inputs.instance }} — code only"
+              echo "No database files changed since the version now in Prod (\`${base:0:7}\`). No migration, no approval."
+              echo ""
+              echo "Test → checked → Prod, without stopping."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "category=$category" >> "$GITHUB_OUTPUT"
+
+  deploy-test:
+    name: Deploy to Test and verify
+    needs: categorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # azure/login, as the Test federated identity
+    env:
+      # Shell env beats rayfin/.env in the CLI's documented precedence, so the
+      # ${RAYFIN_HOSTING_URL:-…} line in rayfin.yml resolves to this
+      # environment's origin — nothing fork-specific committed (the committed
+      # localhost pair only covers local dev).
+      RAYFIN_HOSTING_URL: ${{ vars[format('FABRIC_TEST_HOSTING_URL_{0}', inputs.key)] }}
+    outputs:
+      forced: ${{ steps.schema.outputs.forced }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ vars.MI_TEST_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Fabric token
+        run: |
+          set -euo pipefail
+          TOKEN=$(az account get-access-token --resource "$FABRIC_RESOURCE" --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "RAYFIN_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Type, schema and unit tests (direct pushes skip the PR gate)
+        run: npm run check
+      - name: Deploy to Test
+        run: |
+          set -uo pipefail
+          npx rayfin up --workspace-id ${{ vars[format('FABRIC_TEST_WORKSPACE_ID_{0}', inputs.key)] || vars.FABRIC_TEST_WORKSPACE_ID }} -y 2>&1 | tee up.log
+          exit "${PIPESTATUS[0]}"
+      # Free: the deploy above already ran the static build, so dist/ is this
+      # instance's production bundle. Nothing else in CI or locally reads one,
+      # and a minified entity name reaches the deployed app as a raw UUID in
+      # every lookup column with all other gates green. Failing here stops the
+      # run before Prod. pr.yml has the same check for the PR route.
+      - name: Entity names survived minification
+        run: node scripts/check-bundle.mjs
+      - name: Schema apply (honest exit; force only after a captured refusal)
+        id: schema
+        run: |
+          set -uo pipefail
+          echo "forced=false" >> "$GITHUB_OUTPUT"
+          code=0; out=$(npx rayfin up db apply 2>&1) || code=$?
+          echo "$out" | tail -n 20
+          if [ $code -eq 0 ]; then
+            echo "- Schema applied, no errors" >> "$GITHUB_STEP_SUMMARY"; exit 0
+          fi
+          # Two independent markers: the flag sentence and the operation sentence.
+          # Either alone identifies a refusal, so one CLI rewording doesn't blind us.
+          if echo "$out" | grep -qE "force mode is not enabled|would result in data loss"; then
+            # Fall back to the raw tail if the CLI ever reshapes its refusal
+            # output — an empty evidence block must never reach the approver.
+            refusal=$(echo "$out" | grep -A2 "Details:" | head -5)
+            [ -n "$refusal" ] || refusal=$(echo "$out" | tail -n 6)
+            {
+              echo "### ⚠️ ${{ inputs.instance }} — this change destroys data"
+              echo '```'
+              echo "$refusal"
+              echo '```'
+              echo "Retried with --force on Test, which is where destructive changes are meant to land first. Prod gets --force only if a human approves."
+            } >> "$GITHUB_STEP_SUMMARY"
+            fcode=0; npx rayfin up db apply --force || fcode=$?
+            echo "forced=true" >> "$GITHUB_OUTPUT"
+            exit $fcode
+          fi
+          echo "❌ Schema apply failed for a reason that is not a destructive refusal:" >> "$GITHUB_STEP_SUMMARY"
+          echo "$out" | tail -n 5 >> "$GITHUB_STEP_SUMMARY"
+          echo "(If an SDK bump reworded the refusal, update the markers in this step and re-run the destructive rehearsal — see CLAUDE.md, 'When bumping the SDK'.)" >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+      - name: Approval evidence (read this before approving the schema change)
+        if: needs.categorize.outputs.category == 'schema' || steps.schema.outputs.forced == 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "### Read this before approving"
+            echo "These database files changed since the version now running in Prod. Approving deploys them to the production database."
+            echo ""
+            echo '```diff'
+            if [ -n "${{ needs.categorize.outputs.base_sha }}" ]; then
+              git fetch --quiet origin ${{ needs.categorize.outputs.base_sha }} 2>/dev/null || true
+              diff=$(git diff "${{ needs.categorize.outputs.base_sha }}" HEAD -- rayfin/rayfin.yml packages/shared "instances/${{ inputs.instance }}" | head -200 || true)
+              # An empty evidence block must never reach the approver looking clean.
+              if [ -n "$diff" ]; then
+                echo "$diff"
+              else
+                echo "(diff unavailable from this checkout — compare ${{ needs.categorize.outputs.base_sha }}...HEAD on GitHub before approving)"
+              fi
+            else
+              echo "(first deployment — everything is new)"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Smoke Test (app content + live backend)
+        run: |
+          set -euo pipefail
+          host=$(node -e "const d=require('./rayfin/.deployments.json'); const a=d.deployments[d.active]; console.log(a.hostingUrl)")
+          api=$(node -e "const d=require('./rayfin/.deployments.json'); const a=d.deployments[d.active]; console.log(a.fabricApiUrl)")
+          # Retried: a single 30s probe once rolled back a good deploy when the
+          # static host answered slowly (transient, 2026-08-15). Loops set a
+          # flag and the assertions stand alone — an `A && B` failure inside a
+          # step is "checked" and never fails it.
+          shell_ok=0
+          for i in 1 2 3 4 5; do
+            if curl -sf --max-time 30 "$host" | grep -q 'id="root"'; then shell_ok=1; break; fi
+            sleep 10
+          done
+          [ "$shell_ok" = "1" ]
+          echo "### ${{ inputs.instance }} — Test checked" >> "$GITHUB_STEP_SUMMARY"
+          echo "- App loads: <$host>" >> "$GITHUB_STEP_SUMMARY"
+          hc=000
+          for i in 1 2 3 4 5; do
+            hc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "${api}healthcheck" || echo "000")
+            if [ "$hc" = "200" ]; then break; fi
+            sleep 10
+          done
+          echo "- Backend answers: HTTP $hc" >> "$GITHUB_STEP_SUMMARY"
+          [ "$hc" = "200" ]
+
+  schema-gate:
+    name: Approval gate for schema changes
+    needs: [categorize, deploy-test]
+    # Fires on the git category OR on Test having needed --force: the two can
+    # diverge when Test's database has drifted from the recorded base (measured
+    # after failed schema deploys), and a forced apply must never reach Prod
+    # ungated regardless of what the diff claimed.
+    if: >-
+      needs.categorize.outputs.category == 'schema' ||
+      needs.deploy-test.outputs.forced == 'true'
+    environment: schema-change-approval
+    runs-on: ubuntu-latest
+    permissions: {} # it waits for a human and echoes one line
+    steps:
+      - run: echo "Approved. Evidence lives in the 'Deploy to Test and verify' job summary."
+
+  deploy-prod:
+    name: Deploy to Prod and verify
+    needs: [categorize, deploy-test, schema-gate]
+    if: >-
+      always() && needs.deploy-test.result == 'success' &&
+      (needs.schema-gate.result == 'success' || needs.schema-gate.result == 'skipped')
+    environment: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # azure/login, as the Prod federated identity
+      deployments: write # record this sha as the next run's diff base
+      issues: read # the freeze re-check
+    env:
+      RAYFIN_HOSTING_URL: ${{ vars[format('FABRIC_PROD_HOSTING_URL_{0}', inputs.key)] }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Refuse to deploy while frozen
+        # Re-checked here, not only in categorize. "Re-run failed jobs" reuses
+        # categorize's successful result, so the front-door check never runs
+        # again — which meant the job that just failed against Prod could be
+        # re-run straight into the freeze it had itself opened. A freeze
+        # declared while this run sat at the gate was invisible for the same
+        # reason.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          open=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=deploy-freeze:${{ inputs.instance }}&state=open" --jq 'length')
+          if [ "$open" != "0" ]; then
+            echo "::error::Deploys of ${{ inputs.instance }} are frozen — close its deploy-freeze:${{ inputs.instance }} issue first."
+            exit 1
+          fi
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ vars.MI_PROD_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Fabric token
+        run: |
+          set -euo pipefail
+          TOKEN=$(az account get-access-token --resource "$FABRIC_RESOURCE" --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "RAYFIN_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Deploy to Prod
+        run: |
+          set -uo pipefail
+          npx rayfin up --workspace-id ${{ vars[format('FABRIC_PROD_WORKSPACE_ID_{0}', inputs.key)] || vars.FABRIC_PROD_WORKSPACE_ID }} -y 2>&1 | tee up.log
+          exit "${PIPESTATUS[0]}"
+      - name: PITR anchor
+        # Stamped immediately before the apply, not at job start: `rayfin up`
+        # and its build sit in between, so an anchor taken up here could be ten
+        # minutes early — and restoring to it would discard ten minutes of
+        # unrelated production writes.
+        run: |
+          echo "### Restore point" >> "$GITHUB_STEP_SUMMARY"
+          echo "If this deploy has to be undone, restore the Prod database to \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\` (UTC) — the moment before it changed. Fabric keeps 7 days of restore points." >> "$GITHUB_STEP_SUMMARY"
+      - name: Schema apply (force only if Test needed it)
+        run: |
+          set -uo pipefail
+          force_flag=""
+          if [ "${{ needs.deploy-test.outputs.forced }}" = "true" ]; then force_flag="--force"; fi
+          code=0; out=$(npx rayfin up db apply $force_flag 2>&1) || code=$?
+          echo "$out" | tail -n 20
+          if [ $code -ne 0 ]; then
+            echo "❌ Prod schema apply failed (never auto-escalated):" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "$out" | grep -A3 "Details:" | head -8 >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $code
+      - name: Smoke Prod (app content + live backend, read-only)
+        run: |
+          set -euo pipefail
+          host=$(node -e "const d=require('./rayfin/.deployments.json'); const a=d.deployments[d.active]; console.log(a.hostingUrl)")
+          api=$(node -e "const d=require('./rayfin/.deployments.json'); const a=d.deployments[d.active]; console.log(a.fabricApiUrl)")
+          # Retried: a single 30s probe once rolled back a good deploy when the
+          # static host answered slowly (transient, 2026-08-15). Loops set a
+          # flag and the assertions stand alone — an `A && B` failure inside a
+          # step is "checked" and never fails it.
+          shell_ok=0
+          for i in 1 2 3 4 5; do
+            if curl -sf --max-time 30 "$host" | grep -q 'id="root"'; then shell_ok=1; break; fi
+            sleep 10
+          done
+          [ "$shell_ok" = "1" ]
+          echo "### Prod checked" >> "$GITHUB_STEP_SUMMARY"
+          echo "- App loads: <$host>" >> "$GITHUB_STEP_SUMMARY"
+          hc=000
+          for i in 1 2 3 4 5; do
+            hc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "${api}healthcheck" || echo "000")
+            if [ "$hc" = "200" ]; then break; fi
+            sleep 10
+          done
+          echo "- Backend answers: HTTP $hc" >> "$GITHUB_STEP_SUMMARY"
+          [ "$hc" = "200" ]
+      - name: Keep the exact bundle that passed smoke (rollback redeploys it, no rebuild)
+        uses: actions/upload-artifact@v7
+        with:
+          name: prod-bundle
+          path: dist
+      - name: Record production deployment (the next run's diff base)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '{"ref":"%s","environment":"%s","auto_merge":false,"required_contexts":[],"payload":{"run_id":"%s"}}' "$GITHUB_SHA" "$DEPLOY_ENVIRONMENT" "$GITHUB_RUN_ID" > dep.json
+          id=$(gh api "repos/$GITHUB_REPOSITORY/deployments" --input dep.json --jq '.id')
+          gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" -f state=success >/dev/null
+          echo "### Recorded as the current production version" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit \`${GITHUB_SHA:0:7}\`. The next run compares against this to decide whether the database changed, and a rollback restores this run's build." >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Failure responses ────────────────────────────────────────────────────────
+  # Test broke, or the gate was rejected: put Test back on the last-deployed
+  # sha. Rejection matters because Test may already carry the (possibly forced)
+  # schema the human just declined — leaving it would make the retry's apply
+  # look clean and rob the approver of the refusal evidence.
+  rollback-test:
+    name: If Test fails or is rejected — put Test back
+    needs: [categorize, deploy-test, schema-gate]
+    if: >-
+      always() && needs.categorize.outputs.base_sha != '' &&
+      (contains(fromJSON('["failure","cancelled"]'), needs.deploy-test.result) ||
+       contains(fromJSON('["failure","cancelled"]'), needs.schema-gate.result))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # azure/login, as the Test federated identity
+    env:
+      RAYFIN_HOSTING_URL: ${{ vars[format('FABRIC_TEST_HOSTING_URL_{0}', inputs.key)] }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.categorize.outputs.base_sha }}
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ vars.MI_TEST_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Fabric token
+        run: |
+          set -euo pipefail
+          TOKEN=$(az account get-access-token --resource "$FABRIC_RESOURCE" --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "RAYFIN_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Redeploy last-good sha to Test (schema reversal may need force)
+        run: |
+          set -uo pipefail
+          ucode=0; npx rayfin up --workspace-id ${{ vars[format('FABRIC_TEST_WORKSPACE_ID_{0}', inputs.key)] || vars.FABRIC_TEST_WORKSPACE_ID }} -y > up.log 2>&1 || ucode=$?
+          tail -n 5 up.log
+          [ $ucode -eq 0 ] || exit $ucode
+          code=0; out=$(npx rayfin up db apply 2>&1) || code=$?
+          if [ $code -ne 0 ] && echo "$out" | grep -qE "force mode is not enabled|would result in data loss"; then
+            npx rayfin up db apply --force || exit $?
+          elif [ $code -ne 0 ]; then
+            echo "$out" | tail -n 5; exit $code
+          fi
+          echo "Rolled Test back to ${{ needs.categorize.outputs.base_sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+  # Prod broke on a code-only deploy: stateless, so put it back automatically.
+  rollback-prod:
+    name: If Prod fails — put Prod back (code-only changes)
+    needs: [categorize, deploy-test, schema-gate, deploy-prod]
+    if: >-
+      always() && needs.deploy-prod.result == 'failure' &&
+      needs.categorize.outputs.category == 'code-only' &&
+      needs.deploy-test.outputs.forced != 'true' &&
+      needs.categorize.outputs.base_sha != ''
+    environment: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # azure/login, as the Prod federated identity
+      deployments: read # find the run that shipped the base sha
+      actions: read # download that run's prod-bundle artifact
+    env:
+      RAYFIN_HOSTING_URL: ${{ vars[format('FABRIC_PROD_HOSTING_URL_{0}', inputs.key)] }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.categorize.outputs.base_sha }}
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ vars.MI_PROD_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Fabric token
+        run: |
+          set -euo pipefail
+          TOKEN=$(az account get-access-token --resource "$FABRIC_RESOURCE" --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "RAYFIN_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Fetch the bundle the last good deploy actually shipped
+        id: bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The run that deployed base_sha recorded its run id in the deployment payload;
+          # its prod-bundle artifact is the exact build that passed smoke there.
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/deployments?environment=$DEPLOY_ENVIRONMENT&sha=${{ needs.categorize.outputs.base_sha }}&per_page=1" --jq '.[0].payload.run_id // empty')
+          if [ -n "$run_id" ] && gh run download "$run_id" --name prod-bundle --dir dist; then
+            echo "have_bundle=true" >> "$GITHUB_OUTPUT"
+            echo "Rollback uses the recorded bundle from run $run_id — no rebuild." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "have_bundle=false" >> "$GITHUB_OUTPUT"
+            echo "No recorded bundle for the base sha (pre-artifact deploy) — falling back to rebuilding it." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Redeploy last-good sha to Prod (no schema involved by definition)
+        run: |
+          set -uo pipefail
+          # Settings and backend config from the base sha; static handled below.
+          ucode=0; npx rayfin up --workspace-id ${{ vars[format('FABRIC_PROD_WORKSPACE_ID_{0}', inputs.key)] || vars.FABRIC_PROD_WORKSPACE_ID }} -y --exclude-services staticHosting > up.log 2>&1 || ucode=$?
+          # The whole log, not a 5-line tail: when a ROLLBACK fails this is the
+          # only account of why, and it dies with the runner.
+          cat up.log
+          [ $ucode -eq 0 ] || exit $ucode
+          if [ "${{ steps.bundle.outputs.have_bundle }}" = "true" ]; then
+            npx rayfin up staticapp deploy --skip-build || exit $?
+          else
+            npx rayfin up staticapp deploy || exit $?
+          fi
+      - name: Verify the rollback actually serves
+        # The deploy path asserts the app answers; the recovery path asserted
+        # only that a CLI exited 0. "Rolled Prod back" printed on that basis is
+        # exactly the line an operator stops investigating at.
+        run: |
+          set -euo pipefail
+          host=$(node -e "const d=require('./rayfin/.deployments.json'); const a=d.deployments[d.active]; console.log(a.hostingUrl)")
+          api=$(node -e "const d=require('./rayfin/.deployments.json'); const a=d.deployments[d.active]; console.log(a.fabricApiUrl)")
+          ok=0
+          for i in 1 2 3 4 5; do
+            if curl -sf --max-time 30 "$host" | grep -q 'id="root"'; then ok=1; break; fi
+            sleep 10
+          done
+          [ "$ok" = "1" ]
+          hc=000
+          for i in 1 2 3 4 5; do
+            hc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "${api}healthcheck" || echo "000")
+            if [ "$hc" = "200" ]; then break; fi
+            sleep 10
+          done
+          [ "$hc" = "200" ]
+          echo "Rolled Prod back to ${{ needs.categorize.outputs.base_sha }} — verified serving." >> "$GITHUB_STEP_SUMMARY"
+
+  # Prod broke after a schema change: no automated reversal exists (no
+  # down-migrations; a reverse is a NEW destructive migration). Freeze instead.
+  freeze:
+    name: If Prod fails after a schema change — stop all deploys
+    needs: [categorize, deploy-test, schema-gate, deploy-prod]
+    if: >-
+      always() &&
+      (needs.deploy-prod.result == 'failure' &&
+        (needs.categorize.outputs.category == 'schema' ||
+         needs.deploy-test.outputs.forced == 'true')
+       || needs.deploy-prod.result == 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write # open the freeze issue, and create its label the first time
+    steps:
+      - name: Open the freeze issue (blocks all future deploys until closed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh label create "deploy-freeze:${{ inputs.instance }}" --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "Open = deploys blocked" 2>/dev/null || true
+          gh issue create --repo "$GITHUB_REPOSITORY" --label "deploy-freeze:${{ inputs.instance }}" \
+            --title "DEPLOY FREEZE: schema deploy $GITHUB_SHA failed on Prod" \
+            --body "$(printf 'A schema-category deploy failed against Prod and was NOT reversed automatically — there are no down-migrations, so a reverse is a new destructive migration.\n\nRun: %s/%s/actions/runs/%s\nThe PITR anchor (restore target) and the applied diff are in that run'"'"'s deploy-prod and deploy-test job summaries.\n\nRunbook (docs/operations.md): forward-fix, deliberate reverse migration, or PITR restore (sibling database — copy data back). Close this issue to unfreeze deploys.' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
+          echo "### All deploys stopped" >> "$GITHUB_STEP_SUMMARY"
+          echo "A schema change failed on Prod. There is no automatic way back — undoing a migration is itself a destructive migration — so an issue has been opened and no further deploy will run until it is closed." >> "$GITHUB_STEP_SUMMARY"

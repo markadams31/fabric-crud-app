@@ -1,0 +1,148 @@
+# Deploys every instance, in parallel and independently.
+#
+# This file only decides WHAT to deploy; `deploy-instance.yml` is the pipeline
+# itself and runs once per instance. Instances share a codebase, not a fate: a
+# schema failure in one freezes only that one, and its Prod deploy waiting on a
+# human gate does not hold up any other. That independence is the reason the
+# per-instance pipeline is a reusable workflow rather than a matrix on each job
+# — see the note at the top of deploy-instance.yml.
+name: deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# The CEILING for the called workflow, not a grant to any particular job. A
+# reusable workflow's permissions are capped by its caller, so this has to be
+# the union of what the callee's jobs need; each job in deploy-instance.yml
+# then narrows to its own list, which is where least privilege actually
+# applies. Adding a scope here does not give it to any job that did not ask.
+permissions:
+  id-token: write # azure/login, in the four jobs that deploy
+  contents: read
+  deployments: write # recording a Prod deploy as the next run's baseline
+  issues: write # opening a freeze issue
+  actions: read # rollback-prod downloads the previous run's bundle
+
+jobs:
+  discover:
+    name: Which instances are there?
+    # main only, whatever the trigger. workflow_dispatch runs the workflow file
+    # of the ref it is dispatched from, so without this a branch could deploy —
+    # and the Prod credential is pinned to the `production` ENVIRONMENT, which
+    # is branch-independent unless the environment also restricts branches.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: list
+        name: List instances
+        run: |
+          set -euo pipefail
+          # The directory listing IS the registry — adding an instance is
+          # adding a directory, and nothing here needs editing to pick it up.
+          # `key` is the upper-cased name: Actions variables are stored
+          # upper-cased, so FABRIC_TEST_WORKSPACE_ID_<KEY> is how each
+          # instance's workspace is found, and there is no upper() in
+          # workflow expressions to do it at lookup time.
+          matrix=$(ls -d instances/*/ | xargs -n1 basename | sort |
+            jq -R '{instance: ., key: (. | ascii_upcase | gsub("[^A-Z0-9]"; "_"))}' | jq -sc .)
+          if [ "$matrix" = "[]" ]; then
+            echo "::error::No instances found under instances/ — nothing to deploy."
+            exit 1
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Deploying to Microsoft Fabric"
+            echo "One codebase, $(echo "$matrix" | jq -r 'length') apps: **$(echo "$matrix" | jq -r '[.[].instance] | join("**, **")')**."
+            echo "Each has its own tables and its own Fabric item, and they share the Test and Prod workspaces unless one is given its own."
+            echo "They deploy in parallel and independently — one failing leaves the others running."
+            echo ""
+            echo "Every deploy type-checks, runs the unit tests, deploys, and confirms the app answers"
+            echo "before moving on. The chart at the end of this page shows where each one got to."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  instance:
+    name: ${{ matrix.instance }}
+    needs: discover
+    strategy:
+      # One instance's failure must not cancel another's in-flight deploy —
+      # they are separate Fabric items with separate databases, and a
+      # half-cancelled deploy is exactly what the freeze exists to clean up.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    uses: ./.github/workflows/deploy-instance.yml
+    with:
+      instance: ${{ matrix.instance }}
+      key: ${{ matrix.key }}
+    secrets: inherit
+
+  # ── The picture ──────────────────────────────────────────────────────────────
+  # A called reusable workflow collapses into ONE node in the Actions graph, so
+  # the jobs and the edges between them stopped being visible the moment
+  # instances arrived. Reverting is not an option — `needs` across matrix legs
+  # is exactly what would couple the instances — so the flow is drawn here.
+  #
+  # ONE chart for the whole run, not one per instance: the question a reader
+  # actually has is "did they all get through, and if not which", and that is
+  # answered by seeing the lanes side by side. Job conclusions come from the
+  # API because a matrix job's outputs collapse into one another.
+  flow:
+    name: What happened
+    needs: [discover, instance]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read # read this run's own job conclusions
+    steps:
+      - name: Draw every instance's path
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          INSTANCES: ${{ join(fromJSON(needs.discover.outputs.matrix).*.instance, ' ') }}
+        run: |
+          set -euo pipefail
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
+            --jq '[.jobs[] | {name, r: (.conclusion // .status)}]')
+          res() { echo "$jobs" | jq -r --arg n "$1 / $2" '.[] | select(.name==$n) | .r' | head -1; }
+          cls() { case "$1" in success) echo ok;; cancelled|skipped|"") echo skip;; *) echo bad;; esac; }
+          gly() { case "$1" in success) printf '✅';; cancelled) printf '🚫';; skipped|"") printf '⏭️';; *) printf '❌';; esac; }
+          did() { case "$1" in success) echo "$2";; cancelled) echo cancelled;; skipped|"") echo 'not needed';; *) echo "$3";; esac; }
+          {
+            echo "## Where each app got to"
+            echo ""
+            echo '```mermaid'
+            echo 'flowchart LR'
+            for i in $INSTANCES; do
+              c=$(res "$i" "Did the schema change?");  t=$(res "$i" "Deploy to Test and verify")
+              g=$(res "$i" "Approval gate for schema changes"); p=$(res "$i" "Deploy to Prod and verify")
+              rt=$(res "$i" "If Test fails or is rejected — put Test back")
+              rp=$(res "$i" "If Prod fails — put Prod back (code-only changes)")
+              fz=$(res "$i" "If Prod fails after a schema change — stop all deploys")
+              echo "  subgraph ${i}[\"<b>${i}</b>\"]"
+              echo "    direction LR"
+              echo "    ${i}_c[\"schema change?<br/>$(gly "$c") $(did "$c" checked refused)\"]:::$(cls "$c")"
+              echo "    ${i}_t[\"Test<br/>$(gly "$t") $(did "$t" verified failed)\"]:::$(cls "$t")"
+              echo "    ${i}_g{\"gate<br/>$(gly "$g") $(did "$g" approved rejected)\"}:::$(cls "$g")"
+              echo "    ${i}_p[\"Prod<br/>$(gly "$p") $(did "$p" verified failed)\"]:::$(cls "$p")"
+              echo "    ${i}_c --> ${i}_t --> ${i}_g --> ${i}_p"
+              # Recovery nodes appear only when they fired. A chart full of
+              # things that did not happen is what the job list already is.
+              [ "$rt" != "skipped" ] && [ -n "$rt" ] && { echo "    ${i}_rt[\"put Test back<br/>$(gly "$rt")\"]:::$(cls "$rt")"; echo "    ${i}_t --> ${i}_rt"; } || true
+              [ "$rp" != "skipped" ] && [ -n "$rp" ] && { echo "    ${i}_rp[\"put Prod back<br/>$(gly "$rp")\"]:::$(cls "$rp")"; echo "    ${i}_p --> ${i}_rp"; } || true
+              [ "$fz" != "skipped" ] && [ -n "$fz" ] && { echo "    ${i}_fz[\"FROZEN<br/>this instance only\"]:::bad"; echo "    ${i}_p --> ${i}_fz"; } || true
+              [ "$p" = "success" ] && { echo "    ${i}_d([\"new baseline\"]):::ok"; echo "    ${i}_p --> ${i}_d"; } || true
+              echo "  end"
+            done
+            echo '  classDef ok fill:#E3F7EF,stroke:#117865,color:#01403B'
+            echo '  classDef skip fill:#F5F5F5,stroke:#9E9E9E,color:#5A5A5A'
+            echo '  classDef bad fill:#F7E4E1,stroke:#A83A2C,color:#5C1F17'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

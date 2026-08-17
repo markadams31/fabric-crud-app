@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "ESNext.Decorators"],
+    "useDefineForClassFields": true,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "composite": true,
+    "noEmit": false
+  }
+}

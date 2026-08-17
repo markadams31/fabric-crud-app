@@ -1,0 +1,11 @@
+/*
+ * Fluent supplies the design language, and component styling lives in
+ * `makeStyles` with its tokens so both themes stay correct. Only the page
+ * background belongs here — the viewer paints behind the app, so it has to be
+ * set explicitly rather than inherited.
+ */
+
+body {
+  margin: 0;
+  background: var(--colorNeutralBackground2);
+}

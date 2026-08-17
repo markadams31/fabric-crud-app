@@ -1,0 +1,28 @@
+id: fabric-app-${RAYFIN_INSTANCE:-reference}
+name: Data Manager (${RAYFIN_INSTANCE:-reference})
+version: 0.0.2
+services:
+  auth:
+    enabled: true
+    fabric:
+      enabled: true
+    password:
+      enabled: true
+    allowedRedirectUris:
+      - http://localhost:5173
+      - http://127.0.0.1:5173
+      - ${RAYFIN_HOSTING_URL:-http://localhost:5173}
+  data:
+    enabled: true
+    dialect: mssql
+    path: instances/${RAYFIN_INSTANCE:-reference}
+    buildCommand: npm run build
+  staticHosting:
+    enabled: true
+    folder: dist
+    buildCommand: npm run build
+    indexDocument: index.html
+  storage:
+    enabled: false
+  functions:
+    enabled: false

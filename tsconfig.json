@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    // `ESNext.Decorators` is required: Rayfin entities use TC39 Stage 3
+    // decorators and store metadata via `Symbol.metadata`. The legacy
+    // `experimentalDecorators` pair instead produces TS1238/TS1240 on every one.
+    "lib": ["ES2022", "DOM", "DOM.Iterable", "ESNext.Decorators"],
+    "useDefineForClassFields": true,
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "skipLibCheck": true,
+    "types": ["vite/client"],
+    // `@instance` is the active instance's barrel. Vite resolves the same
+    // specifier from RAYFIN_INSTANCE; tsc can only point at one, so it checks
+    // the default. Every OTHER instance is type-checked by its own `tsc -b`
+    // (npm run check builds all of them), which is what stops a second
+    // instance from breaking unnoticed.
+    "paths": {
+      "@instance": ["./instances/reference/src/index.ts"]
+    }
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "./packages/shared" },
+    { "path": "./instances/reference" },
+    { "path": "./instances/finance" }
+  ]
+}

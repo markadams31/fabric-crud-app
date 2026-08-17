@@ -1,0 +1,87 @@
+# PR validation: the type/schema/unit gate, plus the browser suite against the same
+# local Docker backend developers use — possible in CI because the webservice image's
+# public mirror pulls anonymously (measured 2026-08-15;
+# docs/operations.md).
+name: pr
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Type, schema and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+
+  # The only job that reads a PRODUCTION bundle. `npm run check`, the dev server
+  # and the browser suite all run unminified code, so the defect this catches —
+  # minification erasing the class name that IS the entity name — reached the
+  # deployed app once with every other gate green. Every instance, because each
+  # one is a separate build and a fork's second app must not be the one that
+  # finds out in production.
+  bundle:
+    name: Entity names survive a production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Build and check each instance
+        run: |
+          set -euo pipefail
+          for i in $(ls -d instances/*/ | xargs -n1 basename | sort); do
+            echo "::group::$i"
+            RAYFIN_INSTANCE="$i" npm run build
+            RAYFIN_INSTANCE="$i" node scripts/check-bundle.mjs
+            echo "::endgroup::"
+          done
+
+  e2e:
+    name: Browser tests against a local backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Start local backend (Docker) and apply schema
+        run: node scripts/local.mjs
+      - name: Seed sample data (fresh backends have zero rows)
+        run: node scripts/seed.mjs
+      - name: Start Vite
+        run: |
+          set -euo pipefail
+          nohup npx vite >vite.log 2>&1 &
+          port=$(grep -oP '^VITE_PORT=\K\d+' .env.local || grep -oP '^RAYFIN_PUBLIC_FRONTEND_PORT=\K\d+' rayfin/.env || echo 5173)
+          for i in $(seq 1 60); do
+            curl -sf -o /dev/null "http://localhost:$port" && break
+            sleep 1
+          done
+          curl -sf -o /dev/null "http://localhost:$port"
+      - run: npm run e2e:install
+      - name: Browser tests, writes included
+        # The runner's backend is a container that dies with the job, so the
+        # "think before pointing writes at a shared backend" caveat in the spec
+        # header does not apply here. Without this the gate proved reads only —
+        # create, update, delete and the import write loop never executed.
+        run: E2E_WRITES=1 npm run e2e
+      - name: Keep logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-logs
+          path: vite.log

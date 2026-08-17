@@ -1,0 +1,33 @@
+node_modules/
+dist/
+
+# TypeScript build-mode incremental state.
+*.tsbuildinfo
+
+# Rayfin working directory — compiled entities, generated compose files, logs.
+rayfin/.temp/
+
+# Deploy-time secrets and generated environment files.
+.env
+.env.local
+rayfin/.env
+
+# Written by `rayfin up`. Records the tenant, workspace and item GUIDs plus the
+# publishable key — all specific to one person's deployment, useless to anyone
+# else, and it leaks the origin. The deployment target belongs in CI config, not
+# in the tree.
+rayfin/.deployments.json
+
+# Raw logs never belong in the tree; findings go to docs/ in measured form.
+*.log
+
+# Legacy CLI versions (pre-.deployments.json) wrote these; newer CLIs migrate
+# them away. Kept so an old checkout's leftovers never get committed.
+.env.fabric-*
+
+# Playwright artifacts
+test-results/
+playwright-report/
+
+# Personal Claude Code settings (permission rules) — never commit
+.claude/settings.local.json
