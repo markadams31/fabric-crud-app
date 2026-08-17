@@ -354,6 +354,22 @@ code; `rayfin up`'s own exit covers everything except the schema.
 `/graphql` or `/health` 404s too; `RayfinClient` builds its own data-plane paths from the
 base URL. Connect a real client before concluding anything from probes.
 
+**Deleting a workspace does not stop its app serving.** A day after its workspace was deleted,
+an AppBackend still answered `/healthcheck` with 200 and `/graphql` with 401 — alive, just
+unlisted — while the workspace itself 404s from the normal API and reads `state=Deleted` from
+the admin one. Workspace deletion hides items; it does not tear down what they run. Two
+consequences: the app stays reachable on its public hosting URL after you think you removed it,
+and its SQL database keeps consuming capacity quota (see the resolved incident below).
+
+**A cached bundle outlives the estate it was built for, and the failure reads as a backend
+outage.** The backend endpoint and the publishable key are compiled into the JavaScript at
+build time — `grep -oE 'pk-[A-Za-z0-9]+' dist/assets/*.js` finds the key — so a bundle cached
+from a previous estate calls the previous item. Because a deleted workspace's backend is still
+alive (above), that call is answered rather than refused, and the app reports something like
+"couldn't load the backend" rather than anything about caching. Measured after rebuilding both
+workspaces: the deployed app failed in an open browser session and worked in a fresh one. A
+hard reload is the fix; suspect it whenever an app fails right after an estate is recreated.
+
 **Australia East works; there is no platform rollback** — to roll back, redeploy a previous
 commit.
 

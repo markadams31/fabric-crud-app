@@ -134,6 +134,13 @@ claims, never raw tokens. The SDK persists, refreshes and multi-tab-syncs sessio
 `sub, email, name, role, jti, iat, exp, nbf, iss, aud, sid`. `role` is `"Authenticated"` for
 every signed-in user (see [Layer 5](#layer-5-app-plane-in-app-entity-permissions)).
 
+**Measured (2026-08-18):** the embedded portal handoff was verified for all four deployed
+apps — two instances across Test and Prod — by attaching to a signed-in Chrome over its
+remote-debugging port and opening each item in the portal. Each rendered inside the frame,
+signed in with no prompt, and drew no header of its own. Earlier notes called this check
+human-assisted; a CDP attach makes it scriptable, and it needs no credential handling —
+the browser is already signed in.
+
 **Measured (2026-08-15):** both deployed sign-in modes work end to end against a
 **pipeline-created** Prod item whose redirect allow-list CI injects per environment. The
 standalone session survived a full browser restart on its refresh token. Rows created in these
