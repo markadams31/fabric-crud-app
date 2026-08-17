@@ -568,136 +568,65 @@ docker exec fabric-app-<instance>-admin-db-1 psql -U postgres -d RayfinDB \
 docker restart fabric-app-<instance>-webservice-1   # drops the server's settings cache
 ```
 
-### Incident: new AppBackend items stopped provisioning their database (2026-08-16 to 17, open)
+### Resolved: new AppBackend items could not provision a database (2026-08-16 to 18)
 
-*Measured: CLI 1.34.0, Australia East, FT1 trial capacity. Shelf life: incident — the cause is
-open and the recovery is "retry later".*
+*Measured: CLI 1.34.0, Australia East, FT1 trial capacity. Shelf life: architecture for the
+quota mechanics; preview state for how the CLI reports the refusal.*
 
-**A new AppBackend item is created, then fails runtime-settings sync with a 500 and never
-provisions its SQLDatabase or SQLEndpoint.** The item appears in the workspace; the databases
-never do. `rayfin up` reports `Runtime settings sync failed: 500 Internal Server Error /
-Details: An internal error occurred.` about 60 seconds after creation.
-
-**The failure is inside Fabric, one layer below Rayfin.** The CLI prints the correlation id
-itself — `RootActivityId: <guid>`, on its own line after `Details:` — so read the whole failure
-block rather than grepping for the message. It does *not* show the inner cause; POSTing the
-same request by hand returns:
-
-```
-{"code":"InternalServerError","message":"An internal error occurred.","hresult":-2147467259,
- "details":[{"code":"RootActivityId","message":"9ebcb5fa-e363-4613-9902-45701d54b8c1"},
-            {"code":"PowerBIApiErrorResponse",
-             "message":"{\"error\":{\"code\":\"InternalServerError\",
-                          \"message\":\"An internal execution error occured\"}}"}]}
-```
-
-So the BaaS workload's own call to the **Power BI API** fails; `hresult` is `0x80004005`
-(E_FAIL) with no sub-code. `RootActivityId` also comes back as the `x-ms-root-activity-id`
-header — quote it on a support ticket. To capture it, POST directly rather than reading the
-CLI's summary; the deploy log prints the endpoint:
+**A capacity at its SQL-database limit refuses every new database, and Rayfin reports it as a
+generic 500.** For two days no new AppBackend could provision its SQLDatabase or SQLEndpoint:
+`rayfin up` printed `Runtime settings sync failed: 500 Internal Server Error / Details: An
+internal error occurred.` about 60 seconds after creating the item, and the item sat in the
+workspace with no database behind it and a 404 on its `/healthcheck`. The real error is a
+clean 400, and the way to see it is to create a SQL database directly:
 
 ```sh
-curl -sD- -X POST "<itemEndpoint>/__private/projectRuntimeSettings" \
-  -H "Authorization: Bearer $(az account get-access-token \
-       --resource https://api.fabric.microsoft.com --query accessToken -o tsv)" \
-  -H 'Content-Type: application/json' -d '{"data":{"enabled":true,"dialect":"mssql"}}'
+curl -X POST "$API/workspaces/$WS/items" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"displayName":"probe","type":"SQLDatabase"}'
+# {"errorCode":"SqlDatabasePerCapacityLimitReached",
+#  "message":"Limit of active SQL database items for capacity '...' has been reached."}
 ```
 
-Second sensor: `GET <itemEndpoint>/healthcheck` returns **404** on the stuck item and **200**
-on a working one — the item exists but no backend was ever stood up behind it.
+[rayfin#56](https://github.com/microsoft/rayfin/issues/56), open since 2026-07-23, is exactly
+this: the deploy path turns the refusal into a generic 500. Everything that 500 pointed at —
+an inner `PowerBIApiErrorResponse` from the BaaS workload's own call — was the swallowed
+refusal, not a cause.
 
-**The discriminator is creation versus update, and tearing the estate down does not help.**
-Creating an item fails on every combination tried; updating one succeeds on all of them:
+**Deleting a workspace does not release its SQL databases,** which is what made the quota
+invisible. A database in a deleted workspace keeps `state=Active` against the capacity and
+vanishes from every normal item listing, so the estate reads as empty while its databases are
+still counted. One view shows them:
 
-| the deploy | identity | workspace | result |
-| --- | --- | --- | --- |
-| creates a new item | federated MI (CI) | new, dedicated | 500 |
-| creates a new item | federated MI (CI) | shared, already hosting a working item | 500 |
-| creates a new item | interactive admin, local `rayfin up` | brand-new scratch | 500 |
-| **updates an existing item** | either | either | **200 in ~350 ms** |
+```sh
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://api.fabric.microsoft.com/v1/admin/items?type=SQLDatabase"
+```
 
-In one run (31976768177) the same workflow, identity and capacity applied runtime settings to
-*existing* items in **353 ms** and 500'd on the one item it had just created. Identity,
-workspace, CLI, this repo's configuration: none of them is the variable. A workspace built by
-hand from scratch fails exactly as the pipeline's does, and three distinct new items have
-failed (`RootActivityId` `9ebcb5fa…`, `2581ee71…`, `b28cf7b1…`). Recreating the estate would
-destroy the items that still work without being able to replace them.
+Ten had accumulated across eight deleted workspaces — earlier fork walkthroughs, a retired
+`hr` instance, workspace moves, and every failed probe.
 
-Testing, not reasoning, ruled out four further hypotheses:
+**Recovery is restore, delete the database, delete the workspace again.** Restoring is an
+admin operation (`POST /v1/admin/workspaces/{id}/restore`, taking a new name and an admin
+principal); then delete the `SQLDatabase` item, then delete the workspace. The SQLEndpoint
+goes with its database. The capacity releases the slot about a minute later — a create
+attempted immediately after a delete still refuses. Reclaiming all ten restored the estate to
+a fully green deploy, including the instance that had never once reached Prod.
 
-- a transient 500 → identical on rerun, four times;
-- a stale hosting URL naming a different item → cleared both variables, identical;
-- a half-provisioned item → deleted it and let CI recreate, identical;
-- a database cap on the trial capacity → deleted two workspaces to free two databases,
-  identical.
+**The documented limit and the measured one disagree.** Two Microsoft pages say three: the
+[SQL database limitations](https://learn.microsoft.com/fabric/database/sql/limitations) ("In a
+trial capacity, you are limited to three databases") and the
+[trial FAQ](https://learn.microsoft.com/fabric/fundamentals/fabric-trial) ("you can create up
+to three SQL databases in a Fabric trial capacity"). On this capacity eight consecutive
+creations succeeded, and the refusal appeared with ten active. The trial docs describe an F4
+or F64 capacity; this one is **FT1**, which may be the difference.
 
-The same Prod path succeeded roughly thirteen hours before the first failure. Test deploys keep
-succeeding throughout — but they *update* items that already exist, which the job log
-distinguishes: an update logs "Runtime settings applied", a creation logs "Resource created
-successfully" first.
-
-**A full teardown and rebuild was tried, and it cost the whole estate.** On 2026-08-17 both
-workspaces were deleted and recreated from scratch — fresh ids, capacity assigned, each
-deploying identity granted Contributor again — on the theory that retargeting an instance
-between workspaces had left something inconsistent. It had not: the first deploy into the new
-workspaces failed at **Test**, for both instances, creating two AppBackends with no database
-between them, and Prod was never reached. The rebuilt `reference` item fails exactly like the
-rest (`RootActivityId aee31a44`).
-
-That was the one action this fault makes irreversible. Until it was taken, `reference` served
-Test and Prod normally — not because those workspaces were special, but because its items had
-been *created before the fault began*, and updating an existing item still works. Deleting them
-converted every deploy in the estate into a creation, which is the broken operation. There is
-no way back until the platform recovers.
-
-The hypothesis was already disproven before the teardown, by a cheaper test: an item created by
-hand, with an admin token, in a workspace made seconds earlier and never deployed to, fails the
-same way (`RootActivityId 223c4907`). A brand-new workspace *is* the clean slate — tearing down
-a working one adds no evidence and removes the only apps that still answer.
-
-**Capacity limits were investigated and do not explain it.** The trial reports `FT1`,
-`state: Active` from both the Fabric and Power BI admin APIs. Three measurements argue against
-a quota: the same capacity applied settings to *existing* items in 353 ms while refusing
-creations in the same run, and exhaustion does not discriminate by operation type; creation
-still failed with the estate completely empty — zero AppBackends and zero SQLDatabases — which
-is the most permissive a cap could ever be; and Fabric reports capacity exhaustion explicitly
-(429, `CapacityLimitExceeded`), not as a generic 500 wrapping a `PowerBIApiErrorResponse`. What
-is *not* visible from the API is CU burn and throttling, which live in the Capacity Metrics
-app, or the trial's expiry date.
-
-**A Premium-Per-User capacity cannot host an AppBackend.** Assigning a workspace to a `PP3`
-capacity succeeds, and `rayfin up` then fails at item creation with `403 Forbidden` — a
-different failure from the 500 above, and the reason PPU cannot be used as a fallback capacity.
-
-**Nobody else has reported it publicly, and Microsoft's escalation path for Rayfin is a dead
-link.** The Fabric Apps troubleshooting page ends with "Check the GitHub repository for known
-issues" pointing at `github.com/microsoft/project-rayfin`, which returns 404 — there is no
-public issue tracker. The closest published analogue is a Fabric community thread on a
-recurring 500 from `db apply` ("Failed to apply configuration to remote endpoint"): a different
-call, the same shape, and its accepted answer is the same conclusion reached here — capture the
-timestamp and correlation id and open a support ticket, because this class of failure needs
-backend investigation. The `PowerBIApiErrorResponse` envelope itself is a known Power BI
-backend wrapper, which corroborates that the error is being passed through rather than
-generated by Rayfin. Nothing in the Fabric Apps FAQ documents a trial-capacity restriction or
-any cap on app items per capacity.
-
-**Everything a support ticket needs, in one place.** Seven creations failed, each with its own
-`RootActivityId`; the routing hint was `host004_baas-002`:
-
-| # | what was creating the item | `RootActivityId` |
-| --- | --- | --- |
-| 1 | CI, dedicated Prod workspace | `9ebcb5fa-e363-4613-9902-45701d54b8c1` |
-| 2 | manual POST, shared Prod workspace | `2581ee71-ca7c-46d7-b956-4271e6e1c7bc` |
-| 3 | local `rayfin up`, admin token, scratch workspace | `b28cf7b1-46c6-4dac-8ad6-56c813830a03` |
-| 4 | CI, after deleting the half-provisioned item | `1524c14f-e1c2-44b2-bb4e-64001f683730` |
-| 5 | manual POST to the half-provisioned item | `3f677afa-95e9-4780-9f99-2554f2786964` |
-| 6 | local `rayfin up`, workspace created seconds earlier | `223c4907-467c-4663-907d-c3ad8f3514fb` |
-| 7 | CI, into workspaces rebuilt from scratch | `aee31a44-91de-46ff-b515-a540aa671ce7` |
-
-Recovery: none found, and now nothing to fall back on. The capacity reports `Active`; local
-Docker development is unaffected. Nothing on this side can fix it — the failing call is the
-BaaS workload's own call to the Power BI API — so the next step is a support ticket quoting the
-ids above, not another deploy.
+**Whether the ceiling is even a fixed count is untested.** The error names "SQL database
+*items*", which reads as one, but the threshold could as easily be derived from the capacity's
+size — the same wording would appear either way. Distinguishing them needs the same estate on
+two capacity sizes, and a trial capacity's size cannot be varied here to find out. So take
+neither three nor ten as the number: check
+`admin/items?type=SQLDatabase` against what you are about to create, because the failure is
+silent until it is total.
 
 ## Corrected beliefs
 
@@ -705,6 +634,20 @@ Claims this project (or its predecessor) once held, recorded so they are not re-
 shared lesson: a workaround can be genuinely necessary and still be documented with the wrong
 cause — which is exactly how it survives review.
 
+- **"Capacity limits do not explain the provisioning failures."** Held for two days, written
+  into this file with three supporting measurements, and wrong. It was a capacity limit
+  throughout: `SqlDatabasePerCapacityLimitReached`, from ten orphaned SQL databases left behind
+  by deleted workspaces. The reasoning error is worth naming, because each supporting
+  measurement was individually true. *"Creation still failed with the estate completely
+  empty"* — the estate was empty; the capacity's ledger was not, and only
+  `admin/items?type=SQLDatabase` shows the difference. *"Updates succeed while creations fail,
+  and exhaustion does not discriminate by operation type"* — a quota on *new* items
+  discriminates by exactly that. *"Fabric reports exhaustion as 429, not a 500"* — Fabric did
+  report it cleanly, as a 400; Rayfin swallowed it
+  ([rayfin#56](https://github.com/microsoft/rayfin/issues/56)). Three true observations, each
+  argued from the visible estate rather than the authoritative count, and the conclusion cost a
+  working estate in a teardown that was undertaken to test a hypothesis a cheaper probe had
+  already disproven. When a resource limit is suspected, query the resource, not the symptom.
 - **"A Fluent `DatePicker` cannot live inside a `Popover`."** Held for about an hour while
   building the range facets. The observation was real — opening the calendar dismissed the
   filter panel and lost the typed bound — but the conclusion was too strong. The calendar
