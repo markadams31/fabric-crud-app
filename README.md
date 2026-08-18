@@ -1,5 +1,11 @@
 # Fabric CRUD App Template
 
+[![deploy](https://github.com/markadams31/fabric-crud-app/actions/workflows/deploy.yml/badge.svg)](https://github.com/markadams31/fabric-crud-app/actions/workflows/deploy.yml)
+
+<!-- Forking? Point that badge at your own repository, or it reports this one's
+     builds. The `pr` workflow deliberately has no badge: it runs only on pull
+     requests, so a repo that merges straight to main would show "no status". -->
+
 A CRUD application template for [Microsoft Fabric Apps](https://learn.microsoft.com/fabric/apps/)
 (preview). Define tables as TypeScript classes; one command deploys a SQL database, a GraphQL
 API and a hosted, Entra-authenticated web UI into a Fabric workspace. Fabric's SQL analytics
