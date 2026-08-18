@@ -105,7 +105,11 @@ describe('create / update / skip classification', () => {
     expect(a.counts).toEqual({ create: 1, update: 1, skip: 0 });
   });
 
-  it('reads a lookup under the template label as well as the FK column', () => {
+  // Skipped unless the active instance registers the lookup's target — see
+  // the note in csv.test.ts.
+  const hasLookup = reference('Country').editable.some((f) => f.lookup);
+
+  it.skipIf(!hasLookup)('reads a lookup under the template label as well as the FK column', () => {
     // Both spellings must work: the template now offers `Currency`, and files
     // written against the older `currency_id` template must keep importing.
     // Either way the cell holds a CODE, not a GUID — resolveFk matches any
@@ -128,7 +132,7 @@ describe('create / update / skip classification', () => {
     }
   });
 
-  it('matches an id whatever its case', () => {
+  it.skipIf(!hasLookup)('matches an id whatever its case', () => {
     // SQL Server renders uniqueidentifier UPPERCASE and the API returns it
     // lowercase, so the same id arrives spelled two ways. Both must resolve.
     const country = reference('Country');

@@ -34,7 +34,13 @@ describe('buildTemplate', () => {
     expect(headers.filter((h) => /^(created|updated)/.test(h))).toEqual([]);
   });
 
-  it('asks for a lookup by its label, never its id column', () => {
+  // A lookup is only resolved when its target is in the ACTIVE registry
+  // (entity.ts, foreignKeys) — so under RAYFIN_INSTANCE=finance there is no
+  // Currency, the lookup degrades to a plain `currency_id` column, and this
+  // has nothing to assert. Skip rather than fail, as the browser suite does.
+  const countryHasLookup = reference('Country').editable.some((f) => f.lookup);
+
+  it.skipIf(!countryHasLookup)('asks for a lookup by its label, never its id column', () => {
     // The template used to offer `currency_id`, so filling it in meant pasting
     // GUIDs — the one value a person does not have. The importer always took a
     // code or a name; only the template spoke the database's language.
