@@ -1,6 +1,7 @@
 import Papa from 'papaparse';
 
 import type { Row } from './db';
+import { acceptedHeaders } from './csv';
 import { validateDraft } from './validate';
 import type { EntityView, FieldView } from './entity';
 
@@ -134,8 +135,15 @@ function resolveFk(
   options: Row[],
   display: string[]
 ): { id?: string; error?: string } {
-  if (options.some((o) => o.id === raw)) return { id: raw };
+  // Case-insensitively, because a UUID is case-insensitive by convention and
+  // the two places a person copies one from disagree: the API returns them
+  // lowercase, SQL Server renders `uniqueidentifier` UPPERCASE. Comparing with
+  // `===` meant an id taken from the database — the most authoritative source
+  // available — did not match its own row, and the file failed with "no match"
+  // against a value that was demonstrably correct.
   const needle = raw.toLowerCase();
+  const byId = options.find((o) => String(o.id).toLowerCase() === needle);
+  if (byId) return { id: byId.id };
   const matches = options.filter((o) =>
     display.some((d) => String(o[d] ?? '').toLowerCase() === needle)
   );
@@ -176,11 +184,15 @@ export function analyzeImport(
   /** The table as it stands: id plus every editable column. */
   existing: Row[]
 ): ImportAnalysis {
-  const known = new Set(view.editable.map((f) => f.name));
+  const known = new Set(view.editable.flatMap(acceptedHeaders));
   const ignoredHeaders = headers.filter((h) => !known.has(h));
   const present = new Set(headers.filter((h) => known.has(h)));
   const absentOptional = view.editable
-    .filter((f) => !present.has(f.name) && (f.constraints.optional || f.constraints.type === 'boolean'))
+    .filter(
+      (f) =>
+        !acceptedHeaders(f).some((h) => present.has(h)) &&
+        (f.constraints.optional || f.constraints.type === 'boolean')
+    )
     .map((f) => f.label);
   const missingRequired =
     records.length === 0
@@ -190,7 +202,7 @@ export function analyzeImport(
             (f) =>
               !f.constraints.optional &&
               f.constraints.type !== 'boolean' &&
-              !headers.includes(f.name)
+              !acceptedHeaders(f).some((h) => headers.includes(h))
           )
           .map((f) => f.label);
 
@@ -216,7 +228,8 @@ export function analyzeImport(
     const fkErrors: Record<string, string> = {};
 
     for (const f of view.editable) {
-      const raw = (record[f.name] ?? '').trim();
+      // Either spelling: the template's label, or the FK column name.
+      const raw = (acceptedHeaders(f).map((h) => record[h]).find((v) => v != null) ?? '').trim();
       if (f.lookup && raw) {
         const resolved = resolveFk(raw, lookups[f.name] ?? [], f.lookup.display);
         if (resolved.id) draft[f.name] = resolved.id;

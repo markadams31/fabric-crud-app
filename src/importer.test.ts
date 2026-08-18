@@ -105,6 +105,49 @@ describe('create / update / skip classification', () => {
     expect(a.counts).toEqual({ create: 1, update: 1, skip: 0 });
   });
 
+  it('reads a lookup under the template label as well as the FK column', () => {
+    // Both spellings must work: the template now offers `Currency`, and files
+    // written against the older `currency_id` template must keep importing.
+    // Either way the cell holds a CODE, not a GUID — resolveFk matches any
+    // display value of the target. Sample-pinned: Country -> Currency.
+    const country = reference('Country');
+    const id = '3f2504e0-4f89-41d3-9a0c-0305e82c3301'; // a real UUID: the FK column validates as one
+    const lookups = { currency_id: [{ id, code: 'AUD', name: 'Australian Dollar' }] };
+    const base = { code: 'AU', name: 'Australia', region: 'Asia Pacific', population: '27', isActive: 'true' };
+
+    for (const header of ['Currency', 'currency_id'] as const) {
+      const a = analyzeImport(
+        country,
+        { headers: [...Object.keys(base), header], records: [{ ...base, [header]: 'AUD' }], problems: [] },
+        lookups,
+        []
+      );
+      expect(a.missingRequired, `header ${header}`).toEqual([]);
+      expect(a.rows[0].errors, `header ${header}`).toEqual({});
+      expect(a.rows[0].draft.currency_id, `header ${header}`).toBe(id);
+    }
+  });
+
+  it('matches an id whatever its case', () => {
+    // SQL Server renders uniqueidentifier UPPERCASE and the API returns it
+    // lowercase, so the same id arrives spelled two ways. Both must resolve.
+    const country = reference('Country');
+    const id = '3f2504e0-4f89-41d3-9a0c-0305e82c3301';
+    const lookups = { currency_id: [{ id, code: 'AUD', name: 'Australian Dollar' }] };
+    const base = { code: 'AU', name: 'Australia', region: 'Asia Pacific', population: '27', isActive: 'true' };
+
+    for (const spelling of [id, id.toUpperCase()]) {
+      const a = analyzeImport(
+        country,
+        { headers: [...Object.keys(base), 'Currency'], records: [{ ...base, Currency: spelling }], problems: [] },
+        lookups,
+        []
+      );
+      expect(a.rows[0].errors, spelling).toEqual({});
+      expect(a.rows[0].draft.currency_id, spelling).toBe(id);
+    }
+  });
+
   it('skips a row identical to what is stored', () => {
     const a = analyzeImport(currency, parsed(['AAA,Alpha,,2,true']), {}, existing);
     expect(a.rows[0].op).toBe('skip');

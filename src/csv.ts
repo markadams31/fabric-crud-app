@@ -1,4 +1,28 @@
-import type { EntityView } from './entity';
+import type { EntityView, FieldView } from './entity';
+
+/**
+ * The header a template offers for one field, and every header a file may use
+ * for it.
+ *
+ * A lookup's field name IS its foreign-key column — `currency_id` — and a
+ * template saying that invites a spreadsheet full of GUIDs, which is the one
+ * value a person filling it in does not have and cannot look up. The importer
+ * never needed them: `resolveFk` takes an id *or* any display value of the
+ * target, matched case-insensitively, so `AUD` has always worked. Only the
+ * template was speaking the database's language.
+ *
+ * So a template offers the field's LABEL for a lookup — the same word the grid
+ * column shows — while both spellings are still read, because files written
+ * against the old template must keep importing.
+ */
+export function templateHeader(f: FieldView): string {
+  return f.lookup ? f.label : f.name;
+}
+
+/** Every header accepted for a field: its name, plus a lookup's label. */
+export function acceptedHeaders(f: FieldView): string[] {
+  return f.lookup ? [f.name, f.label] : [f.name];
+}
 
 /**
  * CSV for bulk upload, starting with the template a person fills in.
@@ -37,7 +61,7 @@ export function buildTemplate(view: EntityView): string {
   return (
     view.editable
       .filter((f) => writable.has(f.name))
-      .map((f) => csvEscape(f.name))
+      .map((f) => csvEscape(templateHeader(f)))
       .join(',') + '\r\n'
   );
 }

@@ -33,4 +33,14 @@ describe('buildTemplate', () => {
     expect(headers).not.toContain('id');
     expect(headers.filter((h) => /^(created|updated)/.test(h))).toEqual([]);
   });
+
+  it('asks for a lookup by its label, never its id column', () => {
+    // The template used to offer `currency_id`, so filling it in meant pasting
+    // GUIDs — the one value a person does not have. The importer always took a
+    // code or a name; only the template spoke the database's language.
+    // Sample-pinned: Country's lookup is Currency.
+    const country = buildTemplate(reference('Country')).trim().split(',');
+    expect(country).toContain('Currency');
+    expect(country.filter((h) => h.endsWith('_id'))).toEqual([]);
+  });
 });

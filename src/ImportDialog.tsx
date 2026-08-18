@@ -430,13 +430,25 @@ export function ImportDialog({
               // Never disabled by `busy`: the ref guard handles re-clicks and
               // disabling the focused primary drops focus to <body> — the
               // doctrine all three dialogs share.
+              //
+              // But it must not keep saying "Import 500 rows" while it is
+              // importing them. A long import left the button reading exactly
+              // as it had before the click, so it invited a second one and gave
+              // no sign the first had taken; the ref guard made those clicks
+              // harmless and silent, which is the worst pair. The label changes
+              // instead, as DeleteDialog's does — visible without touching
+              // focus.
               disabled={phase.kind === 'failed' || !analysis || !isImportable(analysis)}
             >
-              {analysis && isImportable(analysis)
-                ? `Import ${analysis.counts.create + analysis.counts.update} ${
-                    analysis.counts.create + analysis.counts.update === 1 ? 'row' : 'rows'
-                  }`
-                : 'Import'}
+              {busy
+                ? phase.kind === 'rolling'
+                  ? 'Undoing…'
+                  : 'Importing…'
+                : analysis && isImportable(analysis)
+                  ? `Import ${analysis.counts.create + analysis.counts.update} ${
+                      analysis.counts.create + analysis.counts.update === 1 ? 'row' : 'rows'
+                    }`
+                  : 'Import'}
             </Button>
           </DialogActions>
         </DialogBody>
