@@ -7,20 +7,20 @@
      requests, so a repo that merges straight to main would show "no status". -->
 
 A CRUD application template for [Microsoft Fabric Apps](https://learn.microsoft.com/fabric/apps/)
-(preview). Define tables as TypeScript classes; one command deploys a SQL database, a GraphQL
-API and a hosted, Entra-authenticated web UI into a Fabric workspace. Fabric's SQL analytics
-endpoint then reads the same tables, so rows maintained in the app are immediately available to
-Power BI, notebooks and warehouse loads.
+(preview). First define tables as TypeScript classes, then one command deploys a SQL database,
+a GraphQL API and a hosted, Entra-authenticated web UI into a Fabric workspace. A SQL analytics
+endpoint reads the same tables, so rows maintained in the app are immediately available to
+Power BI, notebooks and warehouse workloads.
 
-Start here for any app where people maintain rows in a relational database: reference data,
-master data, registers, mappings. Fork it, replace the sample tables with your own, and the UI
-follows.
+Fabric Apps is well suited for data people need to maintain by hand, and which the rest of
+the analytics estate then reads: reference data, master data, registers, mappings. Fork it,
+replace the sample tables with your own, and the UI follows.
 
 > **Don't put production workloads on this template until Fabric Apps is generally available.**
 > Fabric Apps and the Rayfin SDK are in preview: APIs, CLI behaviour, limits and pricing all
 > change between releases. This repo exists for exploring and evaluating the platform.
 
-![The reference instance running inside the Fabric portal: opened as a workspace item, with no separate sign-in. One tab per table, search, faceted filters, bulk import and per-row edit and delete — and the app draws no header of its own, because the portal already names the item.](docs/app-in-portal.png)
+![The `reference` sample app running inside the Fabric portal: opened as a workspace item, with no separate sign-in. One tab per table, search, faceted filters, bulk import and per-row edit and delete.](docs/app-in-portal.png)
 
 *The deployed app, opened from its workspace in the Fabric portal*
 
@@ -59,11 +59,13 @@ export class Region extends Audited() {
 }
 ```
 
-Deploying creates a Fabric **App** item with three child items: a
-[SQL database](https://learn.microsoft.com/fabric/database/sql/overview) whose schema comes
-from these classes, an authentication service brokering Entra sign-in, and static hosting for
-the frontend, which builds its UI from the same decorator metadata at runtime and talks to the
-database through the SDK's generated GraphQL API.
+Deploying creates three items in the workspace:
+
+- an **App**, which runs the application itself: Entra sign-in, a GraphQL API over the
+  database, and static hosting for the frontend
+- a [**SQL database**](https://learn.microsoft.com/fabric/database/sql/overview), whose tables
+  and columns come from the entity classes above
+- a read-only **SQL analytics endpoint** over those same tables, for Power BI and T-SQL clients
 
 ## Architecture
 
@@ -102,10 +104,9 @@ flowchart LR
     style LAKE fill:transparent,stroke:#C0ECDD
 ```
 
-Everything to the right of the database is automatic: every table mirrors into OneLake as delta
-files with no configuration, and the analytics endpoint serves those tables as read-only T-SQL.
-Both paths read the same data — no copies. Who may use each hop is in
-[docs/auth-and-permissions.md](docs/auth-and-permissions.md).
+Everything to the right of the database is automatic. Every table mirrors into OneLake as delta
+files with no configuration, and the analytics endpoint serves those tables via read-only
+T-SQL queries. Both paths read the same data — no copies.
 
 Two instances ship, each with its own tables
 ([instances](#instances-one-codebase-several-apps)). The four in `reference` — Currency,
@@ -113,7 +114,7 @@ Country, UnitOfMeasure, CostCentre — exercise the platform's type system: enum
 emails, dates, a foreign key, unique constraints, optional fields and defaults. `finance` is a
 smaller, separate set. They are examples, not a product: delete them and add your own.
 
-## Quick start (local, no Fabric account)
+## Quick start (local, no Fabric account required)
 
 You need Node 20–24, and Docker for the local backend.
 
@@ -141,22 +142,24 @@ npm run e2e           # read-only tests; E2E_WRITES=1 adds self-cleaning write t
 
 ## Instances: one codebase, several apps
 
-An **instance** is a Fabric app — its own tables, its own Fabric item, its own users — built
-from this one codebase, so a front-end improvement ships to every instance at once. The **item** is the
-unit of separation, not the workspace: instances share the Test and Prod workspaces by default,
-so a ten-instance estate is still two workspaces.
+An organisation usually wants more than one of these apps — one holding a finance team's cost
+codes, another the currency and country lists everyone shares — different tables, identical
+behaviour. An **instance** is one such app: its own tables, its own Fabric item, its own users,
+built from the same codebase. Improve the grid once and every instance has it.
 
-Everything instance-specific lives under `instances/<instance>/`; nothing else knows an
-instance exists. `RAYFIN_INSTANCE` picks one; unset means `reference`, so the default needs no
-ceremony:
+Each instance is a self-contained directory: `instances/finance/` holds finance's tables and
+the registry listing them, and no code outside it names finance. So you add an app by adding a
+directory.
+
+Commands act on one instance at a time. `RAYFIN_INSTANCE` says which, for local development
+and deployment alike:
 
 ```sh
 RAYFIN_INSTANCE=finance npm run dev:local   # or set it once in rayfin/.env
 ```
 
-Adding an instance is four files and one line. Adding a table is one file and two lines in a
-registry. Both, and when instances should share a table, are in
-**[docs/instances-and-tables.md](docs/instances-and-tables.md)**.
+Walkthroughs on defining a new instance — and when instances should share a table definition —
+are in **[docs/instances-and-tables.md](docs/instances-and-tables.md)**.
 
 ## Deploying to Fabric
 
@@ -166,9 +169,11 @@ npm run up      # deploys the active instance's backend, schema and UI
 npm run up:status
 ```
 
-`RAYFIN_INSTANCE` picks which instance goes out, exactly as it does locally. In practice the
-pipeline does the deploying: schema apply is owner-gated, so CI can never migrate an item
-created by hand.
+`RAYFIN_INSTANCE` chooses which instance deploys, exactly as it does locally.
+
+Fabric lets only the identity that **created** an app change that app's schema — so one you
+deploy from your laptop stays yours, and the pipeline is refused if it later tries to migrate
+it. Let CI create anything you want CI to manage.
 
 **[docs/operations.md](docs/operations.md)** has the rest: what a Fabric account needs first,
 the one-off steps after a first deploy, the day-to-day commands and the CI/CD pipeline.
@@ -189,9 +194,8 @@ scripts/              the local Docker backend, and the seeder
 docs/                 how to change the schema, how it deploys, what the platform does
 ```
 
-Inside `src/` the flow runs one way: `entity.ts` turns decorator metadata into a view, `db.ts`
-is the only data access, and the components render from that view alone. Every file opens with
-a comment saying what it owns and why. Start with `entity.ts` for the idea, `EntityPage.tsx`
+Every file opens with a comment saying what it owns and why. `entity.ts` turns the decorators
+into the description every component renders from — start there for the idea, `EntityPage.tsx`
 for the screen.
 
 [Fluent UI React v9](https://react.fluentui.dev/) draws the UI — the design system the Fabric
@@ -201,11 +205,9 @@ to read directly. No router, no form library.
 
 ## Authentication and permissions
 
-Entra handles all authentication; the session arrives differently per environment — free from
-the portal, a local fixture under `dev:local`, brokered once for `npm run dev`. The app has
-exactly two roles, `anonymous` and `authenticated`: no admin tier, no read-only role. Finer
-control comes from Fabric **item** permissions, and each instance is its own item, so granting
-someone one app grants them nothing in another. A workspace is the
+Entra handles all authentication, and inside the app there are just two roles: `anonymous` and
+`authenticated`. Finer control comes from Fabric **item** permissions, and each instance is its
+own item, so granting someone one app grants them nothing in another. A workspace is the
 coarser boundary; a workspace role carries implied permissions on *every* item in it.
 
 Two properties matter before storing anything sensitive. Static assets are served from a public
